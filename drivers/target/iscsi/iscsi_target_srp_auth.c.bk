@@ -1,0 +1,469 @@
+#include <crypto/hash.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/err.h>
+#include <linux/scatterlist.h>
+
+#include <target/iscsi/iscsi_target_core.h>
+#include "iscsi_target_nego.h"
+#include "iscsi_target_srp_auth.h"
+
+/* This functions is usable */
+static int srp_check_group(const char *grp_str)
+{
+	char *tmp, *orig, *token;
+
+	tmp = kstrdup(a_str, GFP_KERNEL);
+	if (!tmp) {
+		pr_err("Memory allocation failed for SRP_GROUP temporary buffer\n");
+		return SRP_UNKNOWN_GROUP;
+	}
+	orig = tmp;
+
+	token = strsep(&tmp, "=");
+	if (!token)
+		goto out;
+
+	if (strcmp(token, "SRP_GROUP")) {
+		pr_err("Unable to locate SRP_GROUP key\n");
+		goto out;
+	}
+	while (token) {
+		token = strsep(&tmp, ",");
+		if (!token)
+			goto out;
+
+		if (!strncmp(token, "SRP-1536", 1)) {
+			pr_debug("Selected SRP-1536 group\n");
+			kfree(orig);
+			return SRP_DEFAULT_GROUP;
+		}
+	}
+out:
+	kfree(orig);
+	return SRP_UNKNOWN_GROUP;
+}
+
+/* This function is usable */
+static void srp_close(struct iscsi_conn *conn)
+{
+	kfree(conn->auth_protocol);
+	conn->auth_protocol = NULL;
+}
+
+
+/*Needs porting*/
+static int srp_string_to_hex(unsigned char *dst, unsigned char *src, int len)
+{
+	int j = DIV_ROUND_UP(len, 2), rc;
+
+	rc = hex2bin(dst, src, j);
+	if (rc < 0)
+		pr_debug("SRP string contains non hex digit symbols\n");
+
+	dst[j] = '\0';
+	return j;
+}
+
+/*Needs porting*/
+static void srp_binaryhex_to_asciihex(char *dst, char *src, int src_len)
+{
+	int i;
+
+	for (i = 0; i < src_len; i++) {
+		sprintf(&dst[i*2], "%02x", (int) src[i] & 0xff);
+	}
+}
+
+/*Needs porting*/
+static void srp_gen_challenge(
+	struct iscsi_conn *conn,
+	int caller,
+	char *c_str,
+	unsigned int *c_len)
+{
+	unsigned char challenge_asciihex[SRP_CHALLENGE_LENGTH * 2 + 1];
+	struct iscsi_srp *srp = conn->auth_protocol;
+
+	memset(challenge_asciihex, 0, SRP_CHALLENGE_LENGTH * 2 + 1);
+
+	get_random_bytes(srp->challenge, SRP_CHALLENGE_LENGTH);
+	srp_binaryhex_to_asciihex(challenge_asciihex, srp->challenge,
+				SRP_CHALLENGE_LENGTH);
+	/*
+	 * Set SRP_C, and copy the generated challenge into c_str.
+	 */
+	*c_len += sprintf(c_str + *c_len, "SRP_C=0x%s", challenge_asciihex);
+	*c_len += 1;
+
+	pr_debug("[%s] Sending SRP_C=0x%s\n\n", (caller) ? "server" : "client",
+			challenge_asciihex);
+}
+
+/*Needs porting*/
+static struct iscsi_srp *srp_server_open(
+	struct iscsi_conn *conn,
+	struct iscsi_node_auth *auth,
+	const char *grp_str,
+	char *aic_str,
+	unsigned int *aic_len)
+{
+	int ret;
+	struct iscsi_srp *srp;
+
+	if (!(auth->naf_flags & NAF_USERID_SET) ||
+	    !(auth->naf_flags & NAF_PASSWORD_SET)) {
+		pr_err("SRP user or password not set for"
+				" Initiator ACL\n");
+		return NULL;
+	}
+
+	conn->auth_protocol = kzalloc(sizeof(struct iscsi_srp), GFP_KERNEL);
+	if (!conn->auth_protocol)
+		return NULL;
+
+	srp = conn->auth_protocol;
+	ret = srp_check_group(grp_str);
+	switch (ret) {
+	case SRP_DEFAULT_GROUP:
+		pr_debug("[server] Got SRP_GROUP=SRP-1536\n");
+		/*
+		 * Send back SRP_ set to MD5.
+		*/
+		*aic_len = sprintf(aic_str, "SRP_A=5");
+		*aic_len += 1;
+		srp->digest_type = SRP_DIGEST_MD5;
+		pr_debug("[server] Sending SRP_A=%d\n", srp->digest_type);
+		break;
+	case SRP_UNKNOWN_GROUP:
+	default:
+		pr_err("Unsupported SRP_GROUP value\n");
+		return NULL;
+	}
+
+	/*
+	 * Set Identifier.
+	 */
+	srp->id = conn->tpg->tpg_srp_id++;
+	*aic_len += sprintf(aic_str + *aic_len, "SRP_I=%d", srp->id);
+	*aic_len += 1;
+	pr_debug("[server] Sending SRP_I=%d\n", srp->id);
+	/*
+	 * Generate Challenge.
+	 */
+	srp_gen_challenge(conn, 1, aic_str, aic_len);
+
+	return srp;
+}
+
+
+/*Needs porting*/
+static int srp_server_compute_md5(
+	struct iscsi_conn *conn,
+	struct iscsi_node_auth *auth,
+	char *nr_in_ptr,
+	char *nr_out_ptr,
+	unsigned int *nr_out_len)
+{
+	unsigned long id;
+	unsigned char id_as_uchar;
+	unsigned char digest[MD5_SIGNATURE_SIZE];
+	unsigned char type, response[MD5_SIGNATURE_SIZE * 2 + 2];
+	unsigned char identifier[10], *challenge = NULL;
+	unsigned char *challenge_binhex = NULL;
+	unsigned char client_digest[MD5_SIGNATURE_SIZE];
+	unsigned char server_digest[MD5_SIGNATURE_SIZE];
+	unsigned char srp_n[MAX_SRP_N_SIZE], srp_r[MAX_RESPONSE_LENGTH];
+	size_t compare_len;
+	struct iscsi_srp *srp = conn->auth_protocol;
+	struct crypto_shash *tfm = NULL;
+	struct shash_desc *desc = NULL;
+	int auth_ret = -1, ret, challenge_len;
+
+	memset(identifier, 0, 10);
+	memset(srp_n, 0, MAX_SRP_N_SIZE);
+	memset(srp_r, 0, MAX_RESPONSE_LENGTH);
+	memset(digest, 0, MD5_SIGNATURE_SIZE);
+	memset(response, 0, MD5_SIGNATURE_SIZE * 2 + 2);
+	memset(client_digest, 0, MD5_SIGNATURE_SIZE);
+	memset(server_digest, 0, MD5_SIGNATURE_SIZE);
+
+	challenge = kzalloc(SRP_CHALLENGE_STR_LEN, GFP_KERNEL);
+	if (!challenge) {
+		pr_err("Unable to allocate challenge buffer\n");
+		goto out;
+	}
+
+	challenge_binhex = kzalloc(SRP_CHALLENGE_STR_LEN, GFP_KERNEL);
+	if (!challenge_binhex) {
+		pr_err("Unable to allocate challenge_binhex buffer\n");
+		goto out;
+	}
+	/*
+	 * Extract SRP_N.
+	 */
+	if (extract_param(nr_in_ptr, "SRP_N", MAX_SRP_N_SIZE, srp_n,
+				&type) < 0) {
+		pr_err("Could not find SRP_N.\n");
+		goto out;
+	}
+	if (type == HEX) {
+		pr_err("Could not find SRP_N.\n");
+		goto out;
+	}
+
+	/* Include the terminating NULL in the compare */
+	compare_len = strlen(auth->userid) + 1;
+	if (strncmp(srp_n, auth->userid, compare_len) != 0) {
+		pr_err("SRP_N values do not match!\n");
+		goto out;
+	}
+	pr_debug("[server] Got SRP_N=%s\n", srp_n);
+	/*
+	 * Extract SRP_R.
+	 */
+	if (extract_param(nr_in_ptr, "SRP_R", MAX_RESPONSE_LENGTH, srp_r,
+				&type) < 0) {
+		pr_err("Could not find SRP_R.\n");
+		goto out;
+	}
+	if (type != HEX) {
+		pr_err("Could not find SRP_R.\n");
+		goto out;
+	}
+
+	pr_debug("[server] Got SRP_R=%s\n", srp_r);
+	srp_string_to_hex(client_digest, srp_r, strlen(srp_r));
+
+	tfm = crypto_alloc_shash("md5", 0, 0);
+	if (IS_ERR(tfm)) {
+		tfm = NULL;
+		pr_err("Unable to allocate struct crypto_shash\n");
+		goto out;
+	}
+
+	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	if (!desc) {
+		pr_err("Unable to allocate struct shash_desc\n");
+		goto out;
+	}
+
+	desc->tfm = tfm;
+	desc->flags = 0;
+
+	ret = crypto_shash_init(desc);
+	if (ret < 0) {
+		pr_err("crypto_shash_init() failed\n");
+		goto out;
+	}
+
+	ret = crypto_shash_update(desc, &srp->id, 1);
+	if (ret < 0) {
+		pr_err("crypto_shash_update() failed for id\n");
+		goto out;
+	}
+
+	ret = crypto_shash_update(desc, (char *)&auth->password,
+				  strlen(auth->password));
+	if (ret < 0) {
+		pr_err("crypto_shash_update() failed for password\n");
+		goto out;
+	}
+
+	ret = crypto_shash_finup(desc, srp->challenge,
+				 SRP_CHALLENGE_LENGTH, server_digest);
+	if (ret < 0) {
+		pr_err("crypto_shash_finup() failed for challenge\n");
+		goto out;
+	}
+
+	srp_binaryhex_to_asciihex(response, server_digest, MD5_SIGNATURE_SIZE);
+	pr_debug("[server] MD5 Server Digest: %s\n", response);
+
+	if (memcmp(server_digest, client_digest, MD5_SIGNATURE_SIZE) != 0) {
+		pr_debug("[server] MD5 Digests do not match!\n\n");
+		goto out;
+	} else
+		pr_debug("[server] MD5 Digests match, SRP connection"
+				" successful.\n\n");
+	/*
+	 * One way authentication has succeeded, return now if mutual
+	 * authentication is not enabled.
+	 */
+	if (!auth->authenticate_target) {
+		auth_ret = 0;
+		goto out;
+	}
+	/*
+	 * Get SRP_I.
+	 */
+	if (extract_param(nr_in_ptr, "SRP_I", 10, identifier, &type) < 0) {
+		pr_err("Could not find SRP_I.\n");
+		goto out;
+	}
+
+	if (type == HEX)
+		ret = kstrtoul(&identifier[2], 0, &id);
+	else
+		ret = kstrtoul(identifier, 0, &id);
+
+	if (ret < 0) {
+		pr_err("kstrtoul() failed for SRP identifier: %d\n", ret);
+		goto out;
+	}
+	if (id > 255) {
+		pr_err("srp identifier: %lu greater than 255\n", id);
+		goto out;
+	}
+	/*
+	 * RFC 1994 says Identifier is no more than octet (8 bits).
+	 */
+	pr_debug("[server] Got SRP_I=%lu\n", id);
+	/*
+	 * Get SRP_C.
+	 */
+	if (extract_param(nr_in_ptr, "SRP_C", SRP_CHALLENGE_STR_LEN,
+			challenge, &type) < 0) {
+		pr_err("Could not find SRP_C.\n");
+		goto out;
+	}
+
+	if (type != HEX) {
+		pr_err("Could not find SRP_C.\n");
+		goto out;
+	}
+	pr_debug("[server] Got SRP_C=%s\n", challenge);
+	challenge_len = srp_string_to_hex(challenge_binhex, challenge,
+				strlen(challenge));
+	if (!challenge_len) {
+		pr_err("Unable to convert incoming challenge\n");
+		goto out;
+	}
+	if (challenge_len > 1024) {
+		pr_err("SRP_C exceeds maximum binary size of 1024 bytes\n");
+		goto out;
+	}
+	/*
+	 * During mutual authentication, the SRP_C generated by the
+	 * initiator must not match the original SRP_C generated by
+	 * the target.
+	 */
+	if (!memcmp(challenge_binhex, srp->challenge, SRP_CHALLENGE_LENGTH)) {
+		pr_err("initiator SRP_C matches target SRP_C, failing"
+		       " login attempt\n");
+		goto out;
+	}
+	/*
+	 * Generate SRP_N and SRP_R for mutual authentication.
+	 */
+	ret = crypto_shash_init(desc);
+	if (ret < 0) {
+		pr_err("crypto_shash_init() failed\n");
+		goto out;
+	}
+
+	/* To handle both endiannesses */
+	id_as_uchar = id;
+	ret = crypto_shash_update(desc, &id_as_uchar, 1);
+	if (ret < 0) {
+		pr_err("crypto_shash_update() failed for id\n");
+		goto out;
+	}
+
+	ret = crypto_shash_update(desc, auth->password_mutual,
+				  strlen(auth->password_mutual));
+	if (ret < 0) {
+		pr_err("crypto_shash_update() failed for"
+				" password_mutual\n");
+		goto out;
+	}
+	/*
+	 * Convert received challenge to binary hex.
+	 */
+	ret = crypto_shash_finup(desc, challenge_binhex, challenge_len,
+				 digest);
+	if (ret < 0) {
+		pr_err("crypto_shash_finup() failed for ma challenge\n");
+		goto out;
+	}
+
+	/*
+	 * Generate SRP_N and SRP_R.
+	 */
+	*nr_out_len = sprintf(nr_out_ptr, "SRP_N=%s", auth->userid_mutual);
+	*nr_out_len += 1;
+	pr_debug("[server] Sending SRP_N=%s\n", auth->userid_mutual);
+	/*
+	 * Convert response from binary hex to ascii hext.
+	 */
+	srp_binaryhex_to_asciihex(response, digest, MD5_SIGNATURE_SIZE);
+	*nr_out_len += sprintf(nr_out_ptr + *nr_out_len, "SRP_R=0x%s",
+			response);
+	*nr_out_len += 1;
+	pr_debug("[server] Sending SRP_R=0x%s\n", response);
+	auth_ret = 0;
+out:
+	kzfree(desc);
+	crypto_free_shash(tfm);
+	kfree(challenge);
+	kfree(challenge_binhex);
+	return auth_ret;
+}
+
+/*Needs porting*/
+static int srp_got_response(
+	struct iscsi_conn *conn,
+	struct iscsi_node_auth *auth,
+	char *nr_in_ptr,
+	char *nr_out_ptr,
+	unsigned int *nr_out_len)
+{
+	struct iscsi_srp *srp = conn->auth_protocol;
+
+	switch (srp->digest_type) {
+	case SRP_DIGEST_MD5:
+		if (srp_server_compute_md5(conn, auth, nr_in_ptr,
+				nr_out_ptr, nr_out_len) < 0)
+			return -1;
+		return 0;
+	default:
+		pr_err("Unknown SRP digest type %d!\n",
+				srp->digest_type);
+		return -1;
+	}
+}
+
+/*Needs porting*/
+u32 srp_main_loop(
+	struct iscsi_conn *conn,
+	struct iscsi_node_auth *auth,
+	char *in_text,
+	char *out_text,
+	int *in_len,
+	int *out_len)
+{
+	struct iscsi_srp *srp = conn->auth_protocol;
+
+	if (!srp) {
+		srp = srp_server_open(conn, auth, in_text, out_text, out_len);
+		if (!srp)
+			return 2;
+		srp->srp_state = SRP_STAGE_SERVER_AIC;
+		return 0;
+	} else if (srp->srp_state == SRP_STAGE_SERVER_AIC) {
+		convert_null_to_semi(in_text, *in_len);
+		if (srp_got_response(conn, auth, in_text, out_text,
+				out_len) < 0) {
+			srp_close(conn);
+			return 2;
+		}
+		if (auth->authenticate_target)
+			srp->srp_state = SRP_STAGE_SERVER_NR;
+		else
+			*out_len = 0;
+		srp_close(conn);
+		return 1;
+	}
+
+	return 2;
+}
