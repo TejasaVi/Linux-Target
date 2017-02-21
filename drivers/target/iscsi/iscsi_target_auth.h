@@ -4,6 +4,7 @@
 #define CHAP_DIGEST_UNKNOWN	0
 #define CHAP_DIGEST_MD5		5
 #define CHAP_DIGEST_SHA		6
+#define CHAP_DIGEST_SHA1	7
 
 #define CHAP_CHALLENGE_LENGTH	16
 #define CHAP_CHALLENGE_STR_LEN	4096
@@ -11,6 +12,7 @@
 #define	MAX_CHAP_N_SIZE		512
 
 #define MD5_SIGNATURE_SIZE	16	/* 16 bytes in a MD5 message digest */
+#define SHA1_SIGNATURE_SIZE	20
 
 #define CHAP_STAGE_CLIENT_A	1
 #define CHAP_STAGE_SERVER_AIC	2

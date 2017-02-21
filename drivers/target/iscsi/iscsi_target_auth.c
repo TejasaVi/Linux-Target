@@ -99,6 +99,10 @@ static int chap_check_algorithm(const char *a_str)
 			pr_debug("Selected MD5 Algorithm\n");
 			kfree(orig);
 			return CHAP_DIGEST_MD5;
+		} else if (!strncmp(token, "7", 1)) {
+			pr_debug("Selected SHA1 Algorithm\n");
+			kfree(orig);
+			return CHAP_DIGEST_SHA1;
 		}
 	}
 out:
@@ -138,6 +142,16 @@ static struct iscsi_chap *chap_server_open(
 		*aic_len = sprintf(aic_str, "CHAP_A=5");
 		*aic_len += 1;
 		chap->digest_type = CHAP_DIGEST_MD5;
+		pr_debug("[server] Sending CHAP_A=%d\n", chap->digest_type);
+		break;
+	case CHAP_DIGEST_SHA1:
+		pr_debug("[server] Got CHAP_A=7\n");
+		/*
+		 * * Send back CHAP_A set to SHA.
+		 */
+		*aic_len = sprintf(aic_str, "CHAP_A=7"); // creating out_text
+		*aic_len += 1; // for including null character
+		chap->digest_type = CHAP_DIGEST_SHA1;
 		pr_debug("[server] Sending CHAP_A=%d\n", chap->digest_type);
 		break;
 	case CHAP_DIGEST_UNKNOWN:
@@ -434,12 +448,290 @@ static int chap_got_response(
 				nr_out_ptr, nr_out_len) < 0)
 			return -1;
 		return 0;
+	case CHAP_DIGEST_SHA1:
+		if (chap_server_compute_sha1(conn, auth, nr_in_ptr,
+					    nr_out_ptr, nr_out_len) < 0)
+			return -1;
+		return 0;
 	default:
 		pr_err("Unknown CHAP digest type %d!\n",
 				chap->digest_type);
 		return -1;
 	}
 }
+
+static int chap_server_compute_sha1(
+	struct iscsi_conn *conn,
+	struct iscsi_node_auth *auth,
+	char *nr_in_ptr,
+	char *nr_out_ptr,
+	unsigned int *nr_out_len)
+{
+	unsigned long id;
+	unsigned char id_as_uchar;
+	unsigned char digest[SHA1_SIGNATURE_SIZE];
+	unsigned char type;
+	unsigned char response[SHA1_SIGNATURE_SIZE * 2 + 2];
+
+	unsigned char identifier[10];
+	unsigned char *challenge = NULL;
+	unsigned char *challenge_binhex = NULL;
+	unsigned char client_digest[SHA1_SIGNATURE_SIZE];
+	unsigned char server_digest[SHA1_SIGNATURE_SIZE];
+	unsigned char chap_n[MAX_CHAP_N_SIZE], chap_r[MAX_RESPONSE_LENGTH];
+	size_t compare_len;
+	struct iscsi_chap *chap = conn->auth_protocol;
+	struct crypto_hash *tfm;
+	struct hash_desc desc;
+	struct scatterlist sg;
+	int auth_ret = -1, ret, challenge_len;
+
+	memset(identifier, 0, 10);
+	memset(chap_n, 0, MAX_CHAP_N_SIZE);
+	memset(chap_r, 0, MAX_RESPONSE_LENGTH);
+	memset(digest, 0, SHA1_SIGNATURE_SIZE);
+	memset(response, 0, SHA1_SIGNATURE_SIZE * 2 + 2);
+	memset(client_digest, 0, SHA1_SIGNATURE_SIZE);
+	memset(server_digest, 0, SHA1_SIGNATURE_SIZE);
+
+	challenge = kzalloc(CHAP_CHALLENGE_STR_LEN, GFP_KERNEL);
+	if (!challenge)
+		goto out;
+
+	challenge_binhex = kzalloc(CHAP_CHALLENGE_STR_LEN, GFP_KERNEL);
+	if (!challenge_binhex)
+		goto out;
+	/*
+	 * Extract CHAP_N.
+	 */
+	if (extract_param(nr_in_ptr, "CHAP_N", MAX_CHAP_N_SIZE, chap_n,
+			 &type) < 0) {
+		pr_err("Could not find CHAP_N.\n");
+		goto out;
+	}
+	if (type == HEX) {
+		pr_err("Could not find CHAP_N.\n");
+		goto out;
+	}
+
+	/* Include the terminating NULL in the compare */
+	compare_len = strlen(auth->userid) + 1;
+	if (strncmp(chap_n, auth->userid, compare_len) != 0) {
+		pr_err("CHAP_N values do not match!\n");
+		goto out;
+	}
+	pr_debug("[server] Got CHAP_N=%s\n", chap_n);
+	/*
+	 * Extract CHAP_R.
+	 */
+	if (extract_param(nr_in_ptr, "CHAP_R", MAX_RESPONSE_LENGTH, chap_r,
+			 &type) < 0) {
+		pr_err("Could not find CHAP_R.\n");
+		goto out;
+	}
+	if (type != HEX) {
+		pr_err("Could not find CHAP_R.\n");
+		goto out;
+	}
+
+	pr_debug("[server] Got CHAP_R=%s\n", chap_r);
+	chap_string_to_hex(client_digest, chap_r, strlen(chap_r));
+	tfm = crypto_alloc_hash("sha1", 0, CRYPTO_ALG_ASYNC);
+	if (IS_ERR(tfm)) {
+		pr_err("Unable to allocate struct crypto_hash\n");
+		goto out;
+	}
+	desc.tfm = tfm;
+	desc.flags = 0;
+	ret = crypto_hash_init(&desc);
+	if (ret < 0) {
+		pr_err("crypto_hash_init() failed\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	sg_init_one(&sg, &chap->id, 1);
+	ret = crypto_hash_update(&desc, &sg, 1);
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for id\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	sg_init_one(&sg, &auth->password, strlen(auth->password));
+	ret = crypto_hash_update(&desc, &sg, strlen(auth->password));
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for password\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	sg_init_one(&sg, chap->challenge, CHAP_CHALLENGE_LENGTH);
+	ret = crypto_hash_update(&desc, &sg, CHAP_CHALLENGE_LENGTH);
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for challenge\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	ret = crypto_hash_final(&desc, server_digest);
+	if (ret < 0) {
+		pr_err("crypto_hash_final() failed for server digest\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+	crypto_free_hash(tfm);
+	chap_binaryhex_to_asciihex(response, server_digest,
+				   SHA1_SIGNATURE_SIZE);
+	pr_debug("[server] SHA1 Server Digest: %s\n", response);
+
+	if (memcmp(server_digest, client_digest, SHA1_SIGNATURE_SIZE) != 0) {
+		pr_debug("[server] SHA1 Digests do not match!\n\n");
+		goto out;
+	} else
+		pr_debug("[server] SHA1 Digests match, CHAP connetication successful.\n\n");
+	/*
+	 * One way authentication has succeeded, return now if mutual
+	 * authentication is not enabled.
+	 */
+
+	if (!auth->authenticate_target) {
+		kfree(challenge);
+		kfree(challenge_binhex);
+		return 0;
+	}
+	/*
+	 * Get CHAP_I.
+	 */
+	if (extract_param(nr_in_ptr, "CHAP_I", 10, identifier, &type) < 0) {
+		pr_err("Could not find CHAP_I.\n");
+		goto out;
+	}
+	if (type == HEX)
+		ret = kstrtoul(&identifier[2], 0, &id);
+	else
+		ret = kstrtoul(identifier, 0, &id);
+	if (ret < 0) {
+		pr_err("kstrtoul() failed for CHAP identifier: %d\n", ret);
+		goto out;
+	}
+	if (id > 255) {
+		pr_err("chap identifier: %lu greater than 255\n", id);
+		goto out;
+	}
+	/*
+	 * RFC 1994 says Identifier is no more than octet (8 bits).
+	 */
+	pr_debug("[server] Got CHAP_I=%lu\n", id);
+	/*
+	 * Get CHAP_C.
+	 */
+	if (extract_param(nr_in_ptr, "CHAP_C", CHAP_CHALLENGE_STR_LEN,
+			 challenge, &type) < 0) {
+		pr_err("Could not find CHAP_C.\n");
+		goto out;
+	}
+
+	if (type != HEX) {
+		pr_err("Could not find CHAP_C.\n");
+		goto out;
+	}
+	pr_debug("[server] Got CHAP_C=%s\n", challenge);
+	challenge_len = chap_string_to_hex(challenge_binhex, challenge,
+					   strlen(challenge));
+	if (!challenge_len) {
+		pr_err("Unable to convert incoming challenge\n");
+		goto out;
+	}
+	if (challenge_len > 1024) {
+		pr_err("CHAP_C exceeds maximum binary size of 1024 bytes\n");
+		goto out;
+	}
+	/*
+	 * During mutual authentication, the CHAP_C generated by the
+	 * initiator must not match the original CHAP_C generated by
+	 * the target.
+	 */
+	if (!memcmp(challenge_binhex, chap->challenge, CHAP_CHALLENGE_LENGTH)) {
+		pr_err("initiator CHAP_C matches target CHAP_C, failing login attempt\n");
+		goto out;
+	}
+	/*
+	 * Generate CHAP_N and CHAP_R for mutual authentication.
+	 */
+	tfm = crypto_alloc_hash("sha1", 0, CRYPTO_ALG_ASYNC);
+	if (IS_ERR(tfm)) {
+		pr_err("Unable to allocate struct crypto_hash\n");
+		goto out;
+	}
+	desc.tfm = tfm;
+	desc.flags = 0;
+
+	ret = crypto_hash_init(&desc);
+	if (ret < 0) {
+		pr_err("crypto_hash_init() failed\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	/* To handle both endiannesses */
+	id_as_uchar = id;
+	sg_init_one(&sg, &id_as_uchar, 1);
+	ret = crypto_hash_update(&desc, &sg, 1);
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for id\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	sg_init_one(&sg, auth->password_mutual,
+		    strlen(auth->password_mutual));
+	ret = crypto_hash_update(&desc, &sg, strlen(auth->password_mutual));
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for password_mutual\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+	/*
+	 * Convert received challenge to binary hex.
+	 */
+	sg_init_one(&sg, challenge_binhex, challenge_len);
+	ret = crypto_hash_update(&desc, &sg, challenge_len);
+	if (ret < 0) {
+		pr_err("crypto_hash_update() failed for ma challenge\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+
+	ret = crypto_hash_final(&desc, digest);
+	if (ret < 0) {
+		pr_err("crypto_hash_final() failed for ma digest\n");
+		crypto_free_hash(tfm);
+		goto out;
+	}
+	crypto_free_hash(tfm);
+	/*
+	 * Generate CHAP_N and CHAP_R.
+	 */
+	*nr_out_len = sprintf(nr_out_ptr, "CHAP_N=%s", auth->userid_mutual);
+	*nr_out_len += 1;
+	pr_debug("[server] Sending CHAP_N=%s\n", auth->userid_mutual);
+	/*
+	 * Convert response from binary hex to ascii hext.
+	 */
+	chap_binaryhex_to_asciihex(response, digest, SHA1_SIGNATURE_SIZE);
+	*nr_out_len += sprintf(nr_out_ptr + *nr_out_len, "CHAP_R=0x%s",
+			       response);
+	*nr_out_len += 1;
+	pr_debug("[server] Sending CHAP_R=0x%s\n", response);
+	auth_ret = 0;
+out:
+	kfree(challenge);
+	kfree(challenge_binhex);
+	return auth_ret;
+}
+
+
 
 u32 chap_main_loop(
 	struct iscsi_conn *conn,
